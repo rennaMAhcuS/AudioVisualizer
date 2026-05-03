@@ -6,10 +6,14 @@ loaded and used via the [Uebersicht](https://tracesof.net/uebersicht/) app.
 This is made possible by replicating the FFT logic used by
 [Rainmeter](https://www.rainmeter.net/).
 
+## Demo
+
+<video src="AudioVisualizer.mp4" width="600" controls></video>
+
 ## Requirements
 
 - macOS 14.2 (Sonoma) or later - required for `CATapDescription` in
-  `visualizer.swift` tp capture `Music.app`'s audio.
+  `visualizer.swift` to capture `Music.app`'s audio.
 - [Uebersicht](https://tracesof.net/uebersicht/)
 - Permissions to record system audio (to capture the Music app's audio) in
   privacy and security.

@@ -1,5 +1,3 @@
-// `swiftc visualizer.swift -o visualizer.out -framework Accelerate -framework CoreAudio -framework AppKit`
-
 import Foundation
 import Accelerate
 import CoreAudio
