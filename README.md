@@ -8,7 +8,7 @@ This is made possible by replicating the FFT logic used by
 
 ## Demo
 
-<video src="AudioVisualizer.mp4" width="600" controls></video>
+![Image](AudioVisualizer.png)
 
 ## Requirements
 
