@@ -1,5 +1,6 @@
-# Executables
+# Executables and deployed folder
 *.out
+/deploy
 
 # macOS
 .DS_Store
