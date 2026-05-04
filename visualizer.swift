@@ -5,56 +5,26 @@ import AppKit
 import Network
 
 // Config
-// All tweakable parameters. Override any via CLI flags (see usage below).
 struct Config {
-    var appBundleID : String = "com.apple.Music" // --app
-    var numBands    : Int    = 119    // --bands        visible bars (BandIdx 1..N)
-    var fftSize     : Int    = 2048   // --fft-size     Rainmeter FFTSize
-    var fftOverlap  : Int    = 1024   // --fft-overlap  Rainmeter FFTOverlap (50% -> 1024)
-    var freqMin     : Float  = 250.0  // --fmin         Rainmeter FreqMin (Hz)
-    var freqMax     : Float  = 16000.0// --fmax         Rainmeter FreqMax (Hz)
-    var sensitivFast: Float  = 32.0   // --sens-fast    Rainmeter Sensitivity (fast)
-    var sensitivSlow: Float  = 40.0   // --sens-slow    Rainmeter Sensitivity (slow)
-    var bandGain    : Float  = 1.0    // --gain         pre-clamp boost (macOS tap is pre-volume)
-    var decayFastMs : Double = 250.0  // --decay-fast   Rainmeter FFTDecay for bars (ms)
-    var decaySlowMs : Double = 500.0  // --decay-slow   Rainmeter FFTDecay for dots (ms)
-    var port        : UInt16 = 9001   // --port         WebSocket server port
+    var numBands    : Int    = 119
+    var fftSize     : Int    = 2048
+    var fftOverlap  : Int    = 1024
+    var freqMin     : Float  = 250.0
+    var freqMax     : Float  = 16000.0
+    var sensitivFast: Float  = 32.0
+    var sensitivSlow: Float  = 40.0
+    var bandGain    : Float  = 0.8    // pre-clamp boost (macOS tap is pre-volume)
+    var decayFastMs    : Double = 250.0
+    var decaySlowMs    : Double = 500.0
+    var fadeOutFastMs  : Double = 50.0
+    var fadeOutSlowMs  : Double = 80.0
+    var port        : UInt16 = 9001
 
     // Derived
     // Rainmeter skips the first and last band (BandIdx 1-N out of N+2 total)
     var numBandsTotal: Int   { numBands + 2 }
     // vDSP gives 2x magnitude vs kiss_fftr -> 4x power; Rainmeter scalar = 1/sqrt(N)
     var binScalar    : Float { 1.0 / (4.0 * sqrt(Float(fftSize))) }
-}
-
-// Usage: ./visualizer [--app <bundleID>] [--bands N] [--fft-size N]
-//        [--fft-overlap N] [--fmin Hz] [--fmax Hz] [--sens-fast dB]
-//        [--sens-slow dB] [--gain x] [--decay-fast ms] [--decay-slow ms]
-//        [--port N]
-func parseConfig() -> Config {
-    var c = Config()
-    var args = Array(CommandLine.arguments.dropFirst())
-    while args.count >= 2 {
-        let key = args.removeFirst()
-        let val = args.removeFirst()
-        switch key {
-        case "--app":          c.appBundleID  = val
-        case "--bands":        c.numBands     = Int(val)    ?? c.numBands
-        case "--fft-size":     c.fftSize      = Int(val)    ?? c.fftSize
-        case "--fft-overlap":  c.fftOverlap   = Int(val)    ?? c.fftOverlap
-        case "--fmin":         c.freqMin      = Float(val)  ?? c.freqMin
-        case "--fmax":         c.freqMax      = Float(val)  ?? c.freqMax
-        case "--sens-fast":    c.sensitivFast = Float(val)  ?? c.sensitivFast
-        case "--sens-slow":    c.sensitivSlow = Float(val)  ?? c.sensitivSlow
-        case "--gain":         c.bandGain     = Float(val)  ?? c.bandGain
-        case "--decay-fast":   c.decayFastMs  = Double(val) ?? c.decayFastMs
-        case "--decay-slow":   c.decaySlowMs  = Double(val) ?? c.decaySlowMs
-        case "--port":         c.port         = UInt16(val) ?? c.port
-        default:
-            print("Unknown flag: \(key)")
-        }
-    }
-    return c
 }
 
 func findPID(bundleID: String) -> pid_t? {
@@ -124,7 +94,9 @@ class AudioVisualizer {
     var slowBands   : [Float]
     let lock        = NSLock()
 
-    var debugTick   : Int = 0
+    var isMusicPlaying: Bool = false
+    var decayTimer    : DispatchSourceTimer?
+    var debugTick     : Int  = 0
 
     // Pre-built idle binary frame (all zeros); built once, reused on every music pause
     lazy var idleBinary: Data = Data(count: config.numBands * 8)
@@ -151,31 +123,50 @@ class AudioVisualizer {
                   let state = note.userInfo?["Player State"] as? String else { return }
             switch state {
             case "Playing", "Fast Forward", "Rewind":
-                if !self.isCapturing, let pid = findPID(bundleID: self.config.appBundleID) {
-                    self.startTap(pid: pid)
-                }
+                self.isMusicPlaying = true
+                self.decayTimer?.cancel()
+                self.decayTimer = nil
+                self.startTapIfNeeded()
             case "Paused", "Stopped":
-                if self.isCapturing { self.stopTap() }
+                self.isMusicPlaying = false
+                if self.isCapturing { self.stopTap(animated: self.wsServer.hasClients) }
             default:
                 break
             }
         }
     }
 
+    func startTapIfNeeded() {
+        guard !isCapturing, isMusicPlaying, wsServer.hasClients else { return }
+        guard let pid = findPID(bundleID: "com.apple.Music") else { return }
+        startTap(pid: pid)
+    }
+
     func start() {
+        wsServer.onClientCountChanged = { [weak self] count in
+            guard let self = self else { return }
+            if count == 0 {
+                self.decayTimer?.cancel()
+                self.decayTimer = nil
+                if self.isCapturing { self.stopTap(animated: false) }
+            } else {
+                self.startTapIfNeeded()
+                if !self.isMusicPlaying && !self.isCapturing { self.pushIdle() }
+            }
+        }
         wsServer.start(port: config.port)
-        guard let pid = findPID(bundleID: config.appBundleID) else {
-            print("\(config.appBundleID) not running - polling every 2s")
+        if findPID(bundleID: "com.apple.Music") != nil {
+            isMusicPlaying = true
+        } else {
+            print("Music not running - polling every 2s")
             Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] t in
                 guard let self = self else { t.invalidate(); return }
-                if let pid = findPID(bundleID: self.config.appBundleID) {
+                if findPID(bundleID: "com.apple.Music") != nil {
                     t.invalidate()
-                    self.startTap(pid: pid)
+                    self.isMusicPlaying = true
                 }
             }
-            return
         }
-        startTap(pid: pid)
     }
 
     func startTap(pid: pid_t) {
@@ -261,7 +252,7 @@ class AudioVisualizer {
         isCapturing = true
     }
 
-    func stopTap() {
+    func stopTap(animated: Bool = false) {
         guard isCapturing else { return }
         isCapturing = false
 
@@ -277,13 +268,48 @@ class AudioVisualizer {
         samplesIn = 0
         ringWrite = 0
 
-        lock.lock()
-        fastBands = [Float](repeating: 0, count: config.numBands)
-        slowBands = [Float](repeating: 0, count: config.numBands)
-        lock.unlock()
+        if animated {
+            startDecayAnimation()
+        } else {
+            lock.lock()
+            fastBands = [Float](repeating: 0, count: config.numBands)
+            slowBands = [Float](repeating: 0, count: config.numBands)
+            lock.unlock()
+            pushIdle()
+            print("Tap stopped")
+        }
+    }
 
-        pushIdle()
-        print("Tap stopped")
+    func startDecayAnimation() {
+        let kFast = Float(exp(log10(0.01) / (60.0 * config.fadeOutFastMs * 0.001)))
+        let kSlow = Float(exp(log10(0.01) / (60.0 * config.fadeOutSlowMs * 0.001)))
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(16))
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            var maxVal: Float = 0
+            for i in 0..<self.config.numBands {
+                self.fastBands[i] *= kFast
+                self.slowBands[i] *= kSlow
+                if self.fastBands[i] > maxVal { maxVal = self.fastBands[i] }
+            }
+            self.lock.unlock()
+            if maxVal < 0.001 {
+                self.decayTimer?.cancel()
+                self.decayTimer = nil
+                self.lock.lock()
+                self.fastBands = [Float](repeating: 0, count: self.config.numBands)
+                self.slowBands = [Float](repeating: 0, count: self.config.numBands)
+                self.lock.unlock()
+                self.pushIdle()
+                print("Tap stopped")
+            } else {
+                self.pushBands()
+            }
+        }
+        timer.resume()
+        decayTimer = timer
     }
 
     private func teardownDevices() {
@@ -437,6 +463,7 @@ class WebSocketServer {
     private var listener      : NWListener?
     private var connections   : [ObjectIdentifier: NWConnection] = [:]
     private var lastHeartbeat : Date = .distantPast
+    var onClientCountChanged  : ((Int) -> Void)?
 
     // True if the renderer sent a heartbeat within the last 2 seconds.
     // Covers the case where the WebSocket stays open but WebKit is paused.
@@ -460,10 +487,12 @@ class WebSocketServer {
     private func accept(_ conn: NWConnection) {
         let id = ObjectIdentifier(conn)
         connections[id] = conn
+        onClientCountChanged?(connections.count)
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
             case .failed, .cancelled:
                 self?.connections.removeValue(forKey: id)
+                self?.onClientCountChanged?(self?.connections.count ?? 0)
             default: break
             }
         }
@@ -503,7 +532,7 @@ class WebSocketServer {
 }
 
 
-let config     = parseConfig()
+let config     = Config()
 let visualizer = AudioVisualizer(config: config)
 visualizer.start()
 RunLoop.main.run()

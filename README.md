@@ -1,14 +1,18 @@
-# An Audio Visualizer for the Apple Music App
+# Audio Visualizer for Apple Music
 
 This is an audio visualizer for the macOS Apple Music app, which can be
 loaded and used via the [Uebersicht](https://tracesof.net/uebersicht/) app.
 
 This is made possible by replicating the FFT logic used by
-[Rainmeter](https://www.rainmeter.net/).
+[Rainmeter](https://www.rainmeter.net/). The design is inspired by the Nexa
+Rainmeter theme's audio visualizer.
 
-## Demo
+## The Result
 
 ![Image](AudioVisualizer.png)
+
+The `MusicInfo.jsx` widget complements the visualizer by displaying info about
+the current song being played.
 
 ## Requirements
 
@@ -46,17 +50,11 @@ Visualizer.jsx (Ubersicht widget)
 swiftc -O visualizer.swift -o visualizer -framework Accelerate -framework CoreAudio -framework AppKit -framework Network
 ```
 
-## Usage
+## Configuration
 
-```sh
-./visualizer [--app <bundleID>] [--bands N] [--fft-size N] \
-  [--fft-overlap N] [--fmin Hz] [--fmax Hz]  \
-  [--sens-fast dB] [--sens-slow dB] [--gain x] \
-  [--decay-fast ms] [--decay-slow ms] [--port N]
-```
-
-Defaults: `com.apple.Music`, 119 bands, FFT size 2048, overlap 1024,
-250-16000 Hz, WebSocket port 9001.
+All parameters are in the `Config` struct at the top of `visualizer.swift`.
+Defaults: 119 bands, FFT size 2048, overlap 1024, 250-16000 Hz, WebSocket port 9001.
+Rebuild after changing any values.
 
 ## Launch at Login
 

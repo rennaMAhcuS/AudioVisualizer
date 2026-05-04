@@ -2,7 +2,7 @@
 const SCALE = 1.0; // overall size multiplier; current values are SCALE = 1
 
 // Base geometry (at SCALE = 1)
-// NUM_BARS must match --bands passed to the Swift binary
+// NUM_BARS must match numBands in the Swift Config struct
 const NUM_BARS = 119;
 const BASE_BAR_W = 4; // px per bar
 const BASE_BAR_GAP = 3; // px gap between bars
@@ -15,8 +15,15 @@ const BASE_MAX_H_VH = 19.75;
 const BAR_COLOR = "rgba(255,255,255,0.92)";
 const PEAK_COLOR = "rgb(236,196,46)";
 
-// Glow via CSS filter (GPU-composited layer effect, unlike canvas shadowBlur which is software-rendered)
-const CANVAS_FILTER = "drop-shadow(0 0 4px rgba(255,255,255,0.55)) drop-shadow(0 0 3px rgba(236,196,46,0.5))";
+// Glow via CSS filter:
+// Tighter white glow (4px to 2px makes it crisper, cheaper)
+// const CANVAS_FILTER = "drop-shadow(0 0 4px rgba(255,255,255,0.5))";
+// const CANVAS_FILTER = "drop-shadow(0 0 2px rgba(255,255,255,0.9))";
+// Gold only (glows the peak dots more than bars - different character)
+// const CANVAS_FILTER = "drop-shadow(0 0 3px rgba(236,196,46,0.7))";
+// Both colors but tighter radii (might land ~10-11%)
+// const CANVAS_FILTER = "drop-shadow(0 0 2px rgba(255,255,2rgba(236,196,46,0.5))";
+const CANVAS_FILTER = "none";
 
 // Widget position
 const BOTTOM_OFFSET = "16%";
@@ -46,7 +53,12 @@ export const init = (dispatch) => {
 
   const connect = () => {
     if (paused) return;
-    if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
+    if (ws) {
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.close();
+      ws = null;
+    }
     ws = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
     ws.binaryType = "arraybuffer";
     let hbInterval = null;
@@ -54,23 +66,35 @@ export const init = (dispatch) => {
     // This covers the case where the WebSocket stays open but the renderer is paused.
     ws.onopen = () => {
       ws.send("");
-      hbInterval = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send(""), 1000);
+      hbInterval = setInterval(
+        () => ws.readyState === WebSocket.OPEN && ws.send(""),
+        1000,
+      );
     };
     ws.onmessage = (e) => {
       if (!(e.data instanceof ArrayBuffer)) return;
       const arr = new Float32Array(e.data);
       if (arr.length !== NUM_BARS * 2) return;
-      dispatch({ type: "FFT", fast: arr.subarray(0, NUM_BARS), slow: arr.subarray(NUM_BARS) });
+      dispatch({
+        type: "FFT",
+        fast: arr.subarray(0, NUM_BARS),
+        slow: arr.subarray(NUM_BARS),
+      });
     };
-    ws.onclose = () => { clearInterval(hbInterval); ws = null; if (!paused) setTimeout(connect, 2000); };
+    ws.onclose = () => {
+      clearInterval(hbInterval);
+      ws = null;
+      if (!paused) setTimeout(connect, 2000);
+    };
     ws.onerror = () => ws && ws.close();
   };
 
   // Stop processing entirely when the desktop is covered (fullscreen app / screen lock).
   document.addEventListener("visibilitychange", () => {
     paused = document.hidden;
-    if (paused) { ws && ws.close(); }
-    else connect();
+    if (paused) {
+      ws && ws.close();
+    } else connect();
   });
 
   connect();
@@ -111,8 +135,10 @@ const draw = (canvas, fast, slow) => {
 export const render = ({ fast, slow }) => {
   const MAX_H = getMaxH();
   const H = MAX_H + PEAK_H + 2;
-  const f = fast && fast.length === NUM_BARS ? fast : new Float32Array(NUM_BARS);
-  const s = slow && slow.length === NUM_BARS ? slow : new Float32Array(NUM_BARS);
+  const f =
+    fast && fast.length === NUM_BARS ? fast : new Float32Array(NUM_BARS);
+  const s =
+    slow && slow.length === NUM_BARS ? slow : new Float32Array(NUM_BARS);
 
   return (
     <canvas
