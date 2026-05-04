@@ -138,7 +138,11 @@ class AudioVisualizer {
 
     func startTapIfNeeded() {
         guard !isCapturing, isMusicPlaying, wsServer.hasClients else { return }
-        guard let pid = findPID(bundleID: "com.apple.Music") else { return }
+        guard let pid = findPID(bundleID: "com.apple.Music") else {
+            isMusicPlaying = false
+            pushIdle()
+            return
+        }
         startTap(pid: pid)
     }
 
