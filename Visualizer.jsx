@@ -1,5 +1,3 @@
-import { run } from "uebersicht";
-
 // Config
 const SCALE = 1.0; // overall size multiplier; current values are SCALE = 1
 
@@ -14,20 +12,11 @@ const BASE_PEAK_H = 3; // peak dot height in px
 const BASE_MAX_H_VH = 19.75;
 
 // Colors
-const BAR_COLOR = "rgba(255,255,255,0.92)"; // fast bars (Rainmeter Color2)
-const PEAK_COLOR = "rgb(236,196,46)"; // slow peak dot (Rainmeter Color1)
+const BAR_COLOR = "rgba(255,255,255,0.92)";
+const PEAK_COLOR = "rgb(236,196,46)";
 
-// Glow
-// Increase spread or opacity for a stronger halo; "none" to disable.
-const BAR_GLOW = "0 0 5px 1px rgba(255,255,255,0.3)";
-const PEAK_GLOW = "0 0 6px 2px rgba(236,196,46,0.8)";
-
-// Transitions
-// These bridge the ~23ms FFT hop so motion looks continuous at 60fps.
-// Raise BAR_TRANSITION to "80ms" for smoother feel; "16ms" for snappier.
-// DOT_TRANSITION should stay ~2x bar.
-const BAR_TRANSITION = "height 60ms ease-out";
-const DOT_TRANSITION = "bottom 100ms ease-out";
+// Glow via CSS filter (GPU-composited layer effect, unlike canvas shadowBlur which is software-rendered)
+const CANVAS_FILTER = "drop-shadow(0 0 4px rgba(255,255,255,0.55)) drop-shadow(0 0 3px rgba(236,196,46,0.5))";
 
 // Widget position
 const BOTTOM_OFFSET = "16%";
@@ -42,7 +31,7 @@ const WIDGET_W = NUM_BARS * (BAR_W + BAR_GAP);
 const getMaxH = () =>
   Math.round(window.innerHeight * (BASE_MAX_H_VH / 100) * SCALE);
 
-export const refreshFrequency = 16; // ~60fps
+const WS_PORT = 9001;
 
 export const className = `
   bottom: ${BOTTOM_OFFSET};
@@ -51,81 +40,86 @@ export const className = `
   width: ${WIDGET_W}px;
 `;
 
-export const command =
-  'cat /tmp/ubersicht-visualizer.json 2>/dev/null || echo \'{"f":[],"s":[]}\'';
+export const init = (dispatch) => {
+  let ws = null;
+  let paused = false;
+
+  const connect = () => {
+    if (paused) return;
+    if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
+    ws = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
+    ws.binaryType = "arraybuffer";
+    let hbInterval = null;
+    // Heartbeat: Swift stops pushing if it doesn't hear from us for >2s.
+    // This covers the case where the WebSocket stays open but the renderer is paused.
+    ws.onopen = () => {
+      ws.send("");
+      hbInterval = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send(""), 1000);
+    };
+    ws.onmessage = (e) => {
+      if (!(e.data instanceof ArrayBuffer)) return;
+      const arr = new Float32Array(e.data);
+      if (arr.length !== NUM_BARS * 2) return;
+      dispatch({ type: "FFT", fast: arr.subarray(0, NUM_BARS), slow: arr.subarray(NUM_BARS) });
+    };
+    ws.onclose = () => { clearInterval(hbInterval); ws = null; if (!paused) setTimeout(connect, 2000); };
+    ws.onerror = () => ws && ws.close();
+  };
+
+  // Stop processing entirely when the desktop is covered (fullscreen app / screen lock).
+  document.addEventListener("visibilitychange", () => {
+    paused = document.hidden;
+    if (paused) { ws && ws.close(); }
+    else connect();
+  });
+
+  connect();
+};
 
 export const initialState = {
-  fast: Array(NUM_BARS).fill(0),
-  slow: Array(NUM_BARS).fill(0),
+  fast: new Float32Array(NUM_BARS),
+  slow: new Float32Array(NUM_BARS),
 };
 
 export const updateState = (event, previousState) => {
-  if (event.type !== "UB/COMMAND_RAN") return previousState;
-  try {
-    const parsed = JSON.parse(event.output);
-    const f = parsed.f,
-      s = parsed.s;
-    if (!Array.isArray(f) || f.length !== NUM_BARS) return previousState;
-    return { fast: f, slow: s };
-  } catch {
-    return previousState;
+  if (event.type !== "FFT") return previousState;
+  return { fast: event.fast, slow: event.slow };
+};
+
+const draw = (canvas, fast, slow) => {
+  const MAX_H = getMaxH();
+  const H = MAX_H + PEAK_H + 2;
+  if (canvas.width !== WIDGET_W) canvas.width = WIDGET_W;
+  if (canvas.height !== H) canvas.height = H;
+
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, WIDGET_W, H);
+
+  ctx.fillStyle = BAR_COLOR;
+  for (let i = 0; i < NUM_BARS; i++) {
+    const barH = Math.max(1, Math.round(fast[i] * MAX_H));
+    ctx.fillRect(i * (BAR_W + BAR_GAP), H - barH, BAR_W, barH);
+  }
+
+  ctx.fillStyle = PEAK_COLOR;
+  for (let i = 0; i < NUM_BARS; i++) {
+    const dotBot = Math.max(0, Math.round(slow[i] * MAX_H) - PEAK_H);
+    ctx.fillRect(i * (BAR_W + BAR_GAP), H - dotBot - PEAK_H, BAR_W, PEAK_H);
   }
 };
 
 export const render = ({ fast, slow }) => {
   const MAX_H = getMaxH();
-  const f = fast && fast.length === NUM_BARS ? fast : Array(NUM_BARS).fill(0);
-  const s = slow && slow.length === NUM_BARS ? slow : Array(NUM_BARS).fill(0);
+  const H = MAX_H + PEAK_H + 2;
+  const f = fast && fast.length === NUM_BARS ? fast : new Float32Array(NUM_BARS);
+  const s = slow && slow.length === NUM_BARS ? slow : new Float32Array(NUM_BARS);
 
   return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "flex-end",
-        gap: `${BAR_GAP}px`,
-        height: `${MAX_H + PEAK_H + 2}px`,
-      }}
-    >
-      {f.map((v, i) => {
-        const barH = Math.max(1, Math.round(v * MAX_H));
-        const dotBot = Math.max(0, Math.round(s[i] * MAX_H) - PEAK_H);
-
-        return (
-          <div
-            key={i}
-            style={{
-              width: `${BAR_W}px`,
-              height: "100%",
-              position: "relative",
-            }}
-          >
-            <div
-              style={{
-                position: "absolute",
-                bottom: 0,
-                width: "100%",
-                height: `${barH}px`,
-                backgroundColor: BAR_COLOR,
-                borderRadius: "1px 1px 0 0",
-                boxShadow: BAR_GLOW,
-                transition: BAR_TRANSITION,
-              }}
-            />
-            <div
-              style={{
-                position: "absolute",
-                bottom: `${dotBot}px`,
-                width: "100%",
-                height: `${PEAK_H}px`,
-                backgroundColor: PEAK_COLOR,
-                borderRadius: "0",
-                boxShadow: PEAK_GLOW,
-                transition: DOT_TRANSITION,
-              }}
-            />
-          </div>
-        );
-      })}
-    </div>
+    <canvas
+      ref={(canvas) => canvas && draw(canvas, f, s)}
+      width={WIDGET_W}
+      height={H}
+      style={{ filter: CANVAS_FILTER }}
+    />
   );
 };

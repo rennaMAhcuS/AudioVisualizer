@@ -2,6 +2,7 @@ import Foundation
 import Accelerate
 import CoreAudio
 import AppKit
+import Network
 
 // Config
 // All tweakable parameters. Override any via CLI flags (see usage below).
@@ -17,7 +18,7 @@ struct Config {
     var bandGain    : Float  = 1.0    // --gain         pre-clamp boost (macOS tap is pre-volume)
     var decayFastMs : Double = 250.0  // --decay-fast   Rainmeter FFTDecay for bars (ms)
     var decaySlowMs : Double = 500.0  // --decay-slow   Rainmeter FFTDecay for dots (ms)
-    var outputPath  : String = "/tmp/ubersicht-visualizer.json" // --output
+    var port        : UInt16 = 9001   // --port         WebSocket server port
 
     // Derived
     // Rainmeter skips the first and last band (BandIdx 1-N out of N+2 total)
@@ -29,7 +30,7 @@ struct Config {
 // Usage: ./visualizer [--app <bundleID>] [--bands N] [--fft-size N]
 //        [--fft-overlap N] [--fmin Hz] [--fmax Hz] [--sens-fast dB]
 //        [--sens-slow dB] [--gain x] [--decay-fast ms] [--decay-slow ms]
-//        [--output path]
+//        [--port N]
 func parseConfig() -> Config {
     var c = Config()
     var args = Array(CommandLine.arguments.dropFirst())
@@ -48,7 +49,7 @@ func parseConfig() -> Config {
         case "--gain":         c.bandGain     = Float(val)  ?? c.bandGain
         case "--decay-fast":   c.decayFastMs  = Double(val) ?? c.decayFastMs
         case "--decay-slow":   c.decaySlowMs  = Double(val) ?? c.decaySlowMs
-        case "--output":       c.outputPath   = val
+        case "--port":         c.port         = UInt16(val) ?? c.port
         default:
             print("Unknown flag: \(key)")
         }
@@ -87,7 +88,8 @@ func findAudioObjectID(pid: pid_t) -> AudioObjectID? {
 }
 
 class AudioVisualizer {
-    let config: Config
+    let config  : Config
+    let wsServer = WebSocketServer()
 
     // CoreAudio objects (nil/0 when tap is inactive)
     var tapID       : AudioObjectID          = 0
@@ -123,7 +125,9 @@ class AudioVisualizer {
     let lock        = NSLock()
 
     var debugTick   : Int = 0
-    var writeTimer  : Timer?
+
+    // Pre-built idle binary frame (all zeros); built once, reused on every music pause
+    lazy var idleBinary: Data = Data(count: config.numBands * 8)
 
     init(config: Config) {
         self.config = config
@@ -159,8 +163,8 @@ class AudioVisualizer {
     }
 
     func start() {
+        wsServer.start(port: config.port)
         guard let pid = findPID(bundleID: config.appBundleID) else {
-            writeIdle()
             print("\(config.appBundleID) not running - polling every 2s")
             Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] t in
                 guard let self = self else { t.invalidate(); return }
@@ -178,7 +182,7 @@ class AudioVisualizer {
         guard !isCapturing else { return }
 
         guard let audioObjID = findAudioObjectID(pid: pid) else {
-            print("Could not find audio object for pid \(pid)"); writeIdle(); return
+            print("Could not find audio object for pid \(pid)"); return
         }
 
         let tapDesc = CATapDescription(stereoMixdownOfProcesses: [audioObjID])
@@ -187,7 +191,7 @@ class AudioVisualizer {
 
         var tapObjectID: AudioObjectID = 0
         guard AudioHardwareCreateProcessTap(tapDesc, &tapObjectID) == noErr else {
-            print("Failed to create process tap"); writeIdle(); return
+            print("Failed to create process tap"); return
         }
         tapID = tapObjectID
 
@@ -205,7 +209,7 @@ class AudioVisualizer {
 
         var newAggID: AudioDeviceID = 0
         guard AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &newAggID) == noErr else {
-            print("Failed to create aggregate device"); writeIdle(); return
+            print("Failed to create aggregate device"); return
         }
         aggDeviceID = newAggID
 
@@ -226,9 +230,6 @@ class AudioVisualizer {
         print("Tap started - rate=\(Int(actualRate))Hz  steps/sec=\(Int(stepsPerSec))  kFast=\(String(format:"%.4f",kDecayFast))  kSlow=\(String(format:"%.4f",kDecaySlow))")
 
         // Band upper-frequency edges: Rainmeter log2-step spacing
-        //   step = log2(freqMax/freqMin) / numBandsTotal
-        //   bandFreq[0] = freqMin * 2^(step/2)
-        //   bandFreq[b] = bandFreq[b-1] * 2^step
         let step = log2(Double(config.freqMax) / Double(config.freqMin)) / Double(config.numBandsTotal)
         bandFreq[0] = config.freqMin * Float(pow(2.0, step / 2.0))
         for b in 1..<config.numBandsTotal {
@@ -258,13 +259,6 @@ class AudioVisualizer {
 
         AudioDeviceStart(newAggID, proc)
         isCapturing = true
-
-        // 60 Hz write timer (runs even when capture is paused so bars decay to zero)
-        if writeTimer == nil {
-            writeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-                self?.writeBands()
-            }
-        }
     }
 
     func stopTap() {
@@ -278,7 +272,6 @@ class AudioVisualizer {
         }
         teardownDevices()
 
-        // Reset bins so bars animate to zero through the write timer
         fastBins = [Float](repeating: 0, count: config.fftSize / 2 + 1)
         slowBins = [Float](repeating: 0, count: config.fftSize / 2 + 1)
         samplesIn = 0
@@ -289,7 +282,7 @@ class AudioVisualizer {
         slowBands = [Float](repeating: 0, count: config.numBands)
         lock.unlock()
 
-        writeIdle()
+        pushIdle()
         print("Tap stopped")
     }
 
@@ -364,7 +357,6 @@ class AudioVisualizer {
                     }
 
                     // Step 2 - frequency-weighted band integration (Rainmeter sweep)
-                    //   y += (freq_span) * bin_power * (2 / sampleRate)
                     let df         = Float(self.sampleRate) / Float(n)
                     let bandScalar = 2.0 / Float(self.sampleRate)
                     var fastBO     = [Float](repeating: 0, count: self.config.numBandsTotal)
@@ -412,27 +404,104 @@ class AudioVisualizer {
                         self.slowBands[b] = max(0, 10.0 / self.config.sensitivSlow * log10f(sRaw + 1e-10) + 1.0)
                     }
                     self.lock.unlock()
+                    DispatchQueue.main.async { [weak self] in self?.pushBands() }
                 }
             }
         }
     }
 
-    func writeBands() {
+    func pushBands() {
+        guard wsServer.hasClients, wsServer.rendererActive else { return }
+        wsServer.broadcast(buildBinary())
+    }
+
+    func pushIdle() {
+        guard wsServer.hasClients else { return }
+        wsServer.broadcast(idleBinary)
+    }
+
+    func buildBinary() -> Data {
         lock.lock()
         let f = fastBands, s = slowBands
         lock.unlock()
-        let fStr = f.map { String(format: "%.4f", $0) }.joined(separator: ",")
-        let sStr = s.map { String(format: "%.4f", $0) }.joined(separator: ",")
-        let json = "{\"f\":[\(fStr)],\"s\":[\(sStr)]}"
-        try? json.write(toFile: config.outputPath, atomically: true, encoding: .utf8)
-    }
-
-    func writeIdle() {
-        let zeros = Array(repeating: "0.0000", count: config.numBands).joined(separator: ",")
-        let json  = "{\"f\":[\(zeros)],\"s\":[\(zeros)]}"
-        try? json.write(toFile: config.outputPath, atomically: true, encoding: .utf8)
+        var data = Data(capacity: config.numBands * 8)
+        f.withUnsafeBytes { data.append(contentsOf: $0) }
+        s.withUnsafeBytes { data.append(contentsOf: $0) }
+        return data
     }
 }
+
+// --- WebSocket Server ---
+
+class WebSocketServer {
+    private var listener      : NWListener?
+    private var connections   : [ObjectIdentifier: NWConnection] = [:]
+    private var lastHeartbeat : Date = .distantPast
+
+    // True if the renderer sent a heartbeat within the last 2 seconds.
+    // Covers the case where the WebSocket stays open but WebKit is paused.
+    var rendererActive: Bool { Date().timeIntervalSince(lastHeartbeat) < 2.0 }
+
+    func start(port: UInt16) {
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        let wsOpts = NWProtocolWebSocket.Options()
+        wsOpts.autoReplyPing = true
+        params.defaultProtocolStack.applicationProtocols.insert(wsOpts, at: 0)
+        guard let l = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else {
+            print("WebSocket server failed on port \(port)"); return
+        }
+        l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
+        l.start(queue: .main)
+        listener = l
+        print("WebSocket server on ws://127.0.0.1:\(port)")
+    }
+
+    private func accept(_ conn: NWConnection) {
+        let id = ObjectIdentifier(conn)
+        connections[id] = conn
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.connections.removeValue(forKey: id)
+            default: break
+            }
+        }
+        receive(conn, id: id)
+        conn.start(queue: .main)
+    }
+
+    private func receive(_ conn: NWConnection, id: ObjectIdentifier) {
+        conn.receiveMessage { [weak self] _, ctx, _, err in
+            guard let self = self else { return }
+            if err != nil {
+                self.connections.removeValue(forKey: id)
+                conn.cancel()
+                return
+            }
+            if let meta = ctx?.protocolMetadata(definition: NWProtocolWebSocket.definition)
+                            as? NWProtocolWebSocket.Metadata,
+               meta.opcode == .close {
+                conn.cancel()
+                return
+            }
+            self.lastHeartbeat = Date()
+            self.receive(conn, id: id)
+        }
+    }
+
+    func broadcast(_ data: Data) {
+        guard !connections.isEmpty else { return }
+        let meta = NWProtocolWebSocket.Metadata(opcode: .binary)
+        let ctx  = NWConnection.ContentContext(identifier: "fft", metadata: [meta])
+        for conn in connections.values {
+            conn.send(content: data, contentContext: ctx, isComplete: true, completion: .idempotent)
+        }
+    }
+
+    var hasClients: Bool { !connections.isEmpty }
+}
+
 
 let config     = parseConfig()
 let visualizer = AudioVisualizer(config: config)

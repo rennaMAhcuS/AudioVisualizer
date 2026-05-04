@@ -7,8 +7,6 @@ const LABEL_COLOR = "rgba(255,255,255,0.45)";
 const VALUE_COLOR = "rgba(255,255,255,0.9)";
 const BOTTOM = "12.5%"; // distance from screen bottom; sits below Visualizer
 
-export const refreshFrequency = 100;
-
 export const className = `
   bottom: ${BOTTOM};
   left: 50%;
@@ -17,6 +15,8 @@ export const className = `
   text-align: center;
   white-space: nowrap;
 `;
+
+export const refreshFrequency = 3000; // 3s; track info changes only between songs
 
 export const command = async (dispatch) => {
   const result = (
