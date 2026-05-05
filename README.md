@@ -9,7 +9,7 @@ Rainmeter theme's audio visualizer.
 
 ## The Result
 
-![Image](screenshot.png)
+![Image](AudioVisualizer.png)
 
 The `MusicInfo.jsx` widget complements the visualizer by displaying info about
 the current song being played.
