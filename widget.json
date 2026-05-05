@@ -1,0 +1,6 @@
+{
+    "name": "Audio Visualizer for Apple Music",
+    "description": "An audio visualizer for the macOS Apple Music app, inspired by the Nexa Rainmeter theme's audio visualizer. Made possible by replicating the FFT logic used by Rainmeter.",
+    "author": "rennaMAhcuS",
+    "email": ""
+}
