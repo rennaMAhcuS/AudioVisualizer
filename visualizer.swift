@@ -134,10 +134,23 @@ class AudioVisualizer {
                 break
             }
         }
+
+        // Catches Music.app being quit while playing; playerInfo may not fire "Stopped" on quit.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self = self,
+                  let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.bundleIdentifier == "com.apple.Music" else { return }
+            self.isMusicPlaying = false
+            if self.isCapturing { self.stopTap(animated: self.wsServer.hasClients) }
+        }
     }
 
     func startTapIfNeeded() {
-        guard !isCapturing, isMusicPlaying, wsServer.hasClients else { return }
+        guard !isCapturing, isMusicPlaying, wsServer.hasClients, wsServer.rendererActive else { return }
         guard let pid = findPID(bundleID: "com.apple.Music") else {
             isMusicPlaying = false
             pushIdle()
@@ -158,18 +171,19 @@ class AudioVisualizer {
                 if !self.isMusicPlaying && !self.isCapturing { self.pushIdle() }
             }
         }
+        wsServer.onRendererBecameActive = { [weak self] in
+            self?.startTapIfNeeded()
+        }
+        wsServer.onRendererBecameInactive = { [weak self] in
+            guard let self = self else { return }
+            if self.isCapturing { self.stopTap(animated: self.wsServer.hasClients) }
+        }
         wsServer.start(port: config.port)
-        if findPID(bundleID: "com.apple.Music") != nil {
+        // Arm isMusicPlaying at startup only if Music is actively outputting audio,
+        // so we don't tap silence if the app is running but paused.
+        if let pid = findPID(bundleID: "com.apple.Music"),
+           findAudioObjectID(pid: pid) != nil {
             isMusicPlaying = true
-        } else {
-            print("Music not running - polling every 2s")
-            Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] t in
-                guard let self = self else { t.invalidate(); return }
-                if findPID(bundleID: "com.apple.Music") != nil {
-                    t.invalidate()
-                    self.isMusicPlaying = true
-                }
-            }
         }
     }
 
@@ -204,7 +218,7 @@ class AudioVisualizer {
 
         var newAggID: AudioDeviceID = 0
         guard AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &newAggID) == noErr else {
-            print("Failed to create aggregate device"); return
+            print("Failed to create aggregate device"); teardownDevices(); return
         }
         aggDeviceID = newAggID
 
@@ -272,7 +286,7 @@ class AudioVisualizer {
         samplesIn = 0
         ringWrite = 0
 
-        if animated {
+        if animated && wsServer.rendererActive {
             startDecayAnimation()
         } else {
             lock.lock()
@@ -464,14 +478,15 @@ class AudioVisualizer {
 // --- WebSocket Server ---
 
 class WebSocketServer {
-    private var listener      : NWListener?
-    private var connections   : [ObjectIdentifier: NWConnection] = [:]
-    private var lastHeartbeat : Date = .distantPast
-    var onClientCountChanged  : ((Int) -> Void)?
+    private var listener          : NWListener?
+    private var connections       : [ObjectIdentifier: NWConnection] = [:]
+    private var heartbeatWatchdog : DispatchSourceTimer?
 
-    // True if the renderer sent a heartbeat within the last 2 seconds.
-    // Covers the case where the WebSocket stays open but WebKit is paused.
-    var rendererActive: Bool { Date().timeIntervalSince(lastHeartbeat) < 2.0 }
+    var onClientCountChanged    : ((Int) -> Void)?
+    var onRendererBecameActive  : (() -> Void)?
+    var onRendererBecameInactive: (() -> Void)?
+
+    private(set) var rendererActive: Bool = false
 
     func start(port: UInt16) {
         let params = NWParameters.tcp
@@ -496,7 +511,13 @@ class WebSocketServer {
             switch state {
             case .failed, .cancelled:
                 self?.connections.removeValue(forKey: id)
-                self?.onClientCountChanged?(self?.connections.count ?? 0)
+                let count = self?.connections.count ?? 0
+                if count == 0 {
+                    self?.heartbeatWatchdog?.cancel()
+                    self?.heartbeatWatchdog = nil
+                    self?.rendererActive = false
+                }
+                self?.onClientCountChanged?(count)
             default: break
             }
         }
@@ -518,9 +539,27 @@ class WebSocketServer {
                 conn.cancel()
                 return
             }
-            self.lastHeartbeat = Date()
+            let wasActive = self.rendererActive
+            self.rendererActive = true
+            self.rescheduleWatchdog()
+            if !wasActive { self.onRendererBecameActive?() }
             self.receive(conn, id: id)
         }
+    }
+
+    // Fires onRendererBecameInactive if no heartbeat arrives within 2.5s.
+    private func rescheduleWatchdog() {
+        heartbeatWatchdog?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 2.5)
+        t.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.rendererActive = false
+            self.heartbeatWatchdog = nil
+            self.onRendererBecameInactive?()
+        }
+        t.resume()
+        heartbeatWatchdog = t
     }
 
     func broadcast(_ data: Data) {

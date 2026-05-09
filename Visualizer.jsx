@@ -22,7 +22,7 @@ const PEAK_COLOR = "rgb(236,196,46)";
 // Gold only (glows the peak dots more than bars - different character)
 // const CANVAS_FILTER = "drop-shadow(0 0 3px rgba(236,196,46,0.7))";
 // Both colors but tighter radii (might land ~10-11%)
-// const CANVAS_FILTER = "drop-shadow(0 0 2px rgba(255,255,2rgba(236,196,46,0.5))";
+// const CANVAS_FILTER = "drop-shadow(0 0 2px rgba(255,255,rgba(236,196,46,0.5))";
 const CANVAS_FILTER = "none";
 
 // Widget position
@@ -50,9 +50,12 @@ export const className = `
 export const init = (dispatch) => {
   let ws = null;
   let paused = false;
+  let hbInterval = null;
 
   const connect = () => {
     if (paused) return;
+    clearInterval(hbInterval);
+    hbInterval = null;
     if (ws) {
       ws.onclose = null;
       ws.onerror = null;
@@ -61,7 +64,6 @@ export const init = (dispatch) => {
     }
     ws = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
     ws.binaryType = "arraybuffer";
-    let hbInterval = null;
     // Heartbeat: Swift stops pushing if it doesn't hear from us for >2s.
     // This covers the case where the WebSocket stays open but the renderer is paused.
     ws.onopen = () => {
@@ -83,6 +85,7 @@ export const init = (dispatch) => {
     };
     ws.onclose = () => {
       clearInterval(hbInterval);
+      hbInterval = null;
       ws = null;
       if (!paused) setTimeout(connect, 2000);
     };
